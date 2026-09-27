@@ -90,8 +90,7 @@ def get_param_blocks(model):
         # crude grouping: use everything up to the 3rd dot as the block key
         # e.g. "model.decoder.layers.4.self_attn.q_proj.weight"
         #      -> "model.decoder.layers.4"
-        parts = name.split(".")
-        block_key = ".".join(parts[:4]) if len(parts) >= 4 else parts[0]
+        block_key = name.rsplit(".", 1)[0] if "." in name else name
         blocks.setdefault(block_key, []).append((name, param))
     return blocks
 
@@ -101,7 +100,7 @@ def get_param_blocks(model):
 # ---------------------------------------------------------------------------
 
 def estimate_block_trace(model, tokenizer, examples, block_params,
-                          num_probes=5):
+                          num_probes=15):
     """
     Estimate the Hessian trace for ONE block using Hutchinson's estimator.
     block_params: list of (name, tensor) for this block only.
@@ -129,21 +128,27 @@ def estimate_block_trace(model, tokenizer, examples, block_params,
     grads = torch.autograd.grad(loss, params, create_graph=True)
 
     trace_sum = 0.0
+    valid_probes = 0
     for _ in range(num_probes):
         zs = [torch.randint(0, 2, p.shape, device=DEVICE).float() * 2 - 1
               for p in params]  # Rademacher: entries are +1 or -1
         gz = sum((g * z).sum() for g, z in zip(grads, zs))
         Hz = torch.autograd.grad(gz, params, retain_graph=True)
-        trace_sum += sum((z * hz).sum().item() for z, hz in zip(zs, Hz))
+        probe_value = sum((z * hz).sum().item() for z, hz in zip(zs, Hz))
+        if not (probe_value != probe_value):  # skip NaN probes (NaN != NaN is True)
+            trace_sum += probe_value
+            valid_probes += 1
 
     for p in params:
         p.requires_grad_(False)
 
-    return trace_sum / num_probes
+    if valid_probes == 0:
+        return float("nan")
+    return trace_sum / valid_probes
 
 
 def estimate_all_block_traces(model, tokenizer, examples, blocks,
-                               num_probes=5):
+                               num_probes=15):
     return {name: estimate_block_trace(model, tokenizer, examples, params,
                                         num_probes=num_probes)
             for name, params in blocks.items()}
