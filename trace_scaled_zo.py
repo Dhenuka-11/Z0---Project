@@ -230,7 +230,13 @@ def mezo_step(model, tokenizer, examples, blocks, sigmas, epsilon, lr):
 # ---------------------------------------------------------------------------
 
 def train(use_trace_scaling, num_steps=500, batch_size=8, lr=1e-6,
-          epsilon=1e-3, trace_refresh_every=50, seed=0):
+          epsilon=1e-3, trace_refresh_every=50, seed=0, log_path=None):
+    """
+    log_path: if given, results are saved as JSON to this path, containing
+    per-step loss and, at each trace-refresh point, a summary of the sigma
+    values used (min/mean/max across blocks) -- not the full per-block
+    detail (that is added separately for the Week 9 diagnostic).
+    """
     random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -241,6 +247,7 @@ def train(use_trace_scaling, num_steps=500, batch_size=8, lr=1e-6,
 
     sigmas = {name: 1.0 for name in blocks}  # baseline default
     loss_log = []
+    sigma_summary_log = []  # list of {step, min, mean, max}
 
     for step in range(num_steps):
         if use_trace_scaling and step % trace_refresh_every == 0:
@@ -249,6 +256,13 @@ def train(use_trace_scaling, num_steps=500, batch_size=8, lr=1e-6,
             traces = estimate_all_block_traces(model, tokenizer,
                                                 probe_examples, blocks)
             sigmas = compute_sigmas(traces, blocks)
+            values = list(sigmas.values())
+            sigma_summary_log.append({
+                "step": step,
+                "min": min(values),
+                "mean": sum(values) / len(values),
+                "max": max(values),
+            })
 
         batch_idx = random.sample(range(len(train_data)), batch_size)
         batch = [train_data[i] for i in batch_idx]
@@ -259,6 +273,19 @@ def train(use_trace_scaling, num_steps=500, batch_size=8, lr=1e-6,
 
         if step % 20 == 0:
             print(f"step {step:4d}  loss {loss:.4f}")
+
+    if log_path is not None:
+        import json
+        with open(log_path, "w") as f:
+            json.dump({
+                "use_trace_scaling": use_trace_scaling,
+                "num_steps": num_steps,
+                "lr": lr,
+                "seed": seed,
+                "losses": loss_log,
+                "sigma_summary": sigma_summary_log,
+            }, f, indent=2)
+        print(f"saved log to {log_path}")
 
     return loss_log
 
