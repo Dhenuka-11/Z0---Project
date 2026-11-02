@@ -249,10 +249,13 @@ def train(use_trace_scaling, num_steps=500, batch_size=8, lr=1e-6,
     loss_log = []
     sigma_summary_log = []  # list of {step, min, mean, max}
 
+    batch_rng = random.Random(seed)
+    probe_rng = random.Random(seed + 1000)
+
     for step in range(num_steps):
         if use_trace_scaling and step % trace_refresh_every == 0:
             probe_examples = [train_data[i] for i in
-                               random.sample(range(len(train_data)), 1)]
+                               probe_rng.sample(range(len(train_data)), 1)]
             traces = estimate_all_block_traces(model, tokenizer,
                                                 probe_examples, blocks)
             sigmas = compute_sigmas(traces, blocks)
@@ -264,8 +267,9 @@ def train(use_trace_scaling, num_steps=500, batch_size=8, lr=1e-6,
                 "max": max(values),
             })
 
-        batch_idx = random.sample(range(len(train_data)), batch_size)
+        batch_idx = batch_rng.sample(range(len(train_data)), batch_size)
         batch = [train_data[i] for i in batch_idx]
+        random.seed(seed * 100000 + step)  # same perturbation seed in both methods
 
         loss = mezo_step(model, tokenizer, batch, blocks, sigmas,
                           epsilon, lr)

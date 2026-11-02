@@ -2,8 +2,8 @@ import os
 import time
 from trace_scaled_zo import train
 
-SEEDS = [0, 1, 2]
-NUM_STEPS = 100
+SEEDS = [0, 1, 2, 3, 4]
+NUM_STEPS = 500
 
 os.makedirs("logs", exist_ok=True)
 
