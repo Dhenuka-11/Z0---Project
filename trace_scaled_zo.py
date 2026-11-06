@@ -72,6 +72,32 @@ def compute_loss(model, tokenizer, examples):
     return total_loss / len(examples)
 
 
+def evaluate_accuracy(model, tokenizer, examples, max_examples=None):
+    """
+    Held-out evaluation (Week 7 harness). For each example, compare the
+    model's next-token logits for the two label words and predict the larger
+    one. Also returns the mean label-word loss on the same examples.
+    `examples` can be a HuggingFace split or a list of dicts. Uses no
+    randomness, so calling it never changes a training run.
+    """
+    label_token_ids = [tokenizer(w, add_special_tokens=False).input_ids[0]
+                       for w in LABEL_WORDS]
+    n = len(examples) if max_examples is None else min(max_examples, len(examples))
+    correct = 0
+    total_loss = 0.0
+    with torch.no_grad():
+        for i in range(n):
+            ex = examples[i]
+            input_ids = tokenizer(build_prompt(ex["sentence"]),
+                                  return_tensors="pt").input_ids.to(DEVICE)
+            logits = model(input_ids).logits[0, -1, :]
+            pred = int(logits[label_token_ids].argmax().item())
+            correct += int(pred == ex["label"])
+            log_probs = F.log_softmax(logits, dim=-1)
+            total_loss += -log_probs[label_token_ids[ex["label"]]].item()
+    return {"accuracy": correct / n, "loss": total_loss / n, "n": n}
+
+
 # ---------------------------------------------------------------------------
 # Section 2 & 3: block partition
 # ---------------------------------------------------------------------------
@@ -225,40 +251,132 @@ def mezo_step(model, tokenizer, examples, blocks, sigmas, epsilon, lr):
     return (loss_plus + loss_minus) / 2  # rough loss estimate for logging
 
 
+def mezo_step_multi(model, tokenizer, examples, blocks, sigmas, epsilon, lr,
+                    num_perturbations):
+    """
+    Same as mezo_step, but averages P independent perturbation directions
+    per step (the Week 12 perturbation-count check, motivated by Paper 3).
+    Every direction is evaluated at the same starting weights, then all P
+    updates are applied, each scaled by lr / P. Costs P times as many
+    forward passes as mezo_step.
+    """
+    seeds = [random.randint(0, 2**31 - 1) for _ in range(num_perturbations)]
+
+    def perturb(seed, scale):
+        torch.manual_seed(seed)
+        for name, params in blocks.items():
+            sigma = sigmas[name]
+            for _, p in params:
+                z = torch.randn_like(p)
+                p.add_(scale * sigma * z)
+
+    loss_estimates = []
+    grad_scalars = []
+    with torch.no_grad():
+        for s in seeds:
+            perturb(s, +epsilon)
+            loss_plus = compute_loss(model, tokenizer, examples)
+            perturb(s, -epsilon)
+            perturb(s, -epsilon)
+            loss_minus = compute_loss(model, tokenizer, examples)
+            perturb(s, +epsilon)  # back to the original weights
+            grad_scalars.append((loss_plus - loss_minus) / (2 * epsilon))
+            loss_estimates.append((loss_plus + loss_minus) / 2)
+
+        for s, g in zip(seeds, grad_scalars):
+            perturb(s, -(lr / num_perturbations) * g)
+
+    return sum(loss_estimates) / num_perturbations
+
+
 # ---------------------------------------------------------------------------
 # Section 7: training loop wiring both variants
 # ---------------------------------------------------------------------------
 
+def _nan_to_none(x):
+    return None if (x != x) else float(x)
+
+
 def train(use_trace_scaling, num_steps=500, batch_size=8, lr=1e-6,
-          epsilon=1e-3, trace_refresh_every=50, seed=0, log_path=None):
+          epsilon=1e-3, trace_refresh_every=50, seed=0, log_path=None,
+          sigma_rule="inv_sqrt", delta=1e-4, num_probes=15,
+          sigma_mode="trace", trace_average=False, num_perturbations=1,
+          eval_steps=(), eval_examples=None, log_block_details=False):
     """
-    log_path: if given, results are saved as JSON to this path, containing
-    per-step loss and, at each trace-refresh point, a summary of the sigma
-    values used (min/mean/max across blocks) -- not the full per-block
-    detail (that is added separately for the Week 9 diagnostic).
+    log_path: if given, results are saved as JSON to this path.
+
+    Every option after log_path is for the Week 7-12 experiments, and each
+    default reproduces the original behaviour exactly (same batches, same
+    random numbers), so earlier logs stay comparable.
+
+    sigma_rule:        "inv_sqrt" (1/sqrt(trace)) or "inv" (1/trace)
+    delta:             constant added to the trace before inverting
+    num_probes:        Hutchinson probes per block at each refresh
+    sigma_mode:        "trace"    -> sigma set from the traces (the method)
+                       "shuffled" -> same traces, but randomly reassigned to
+                                     other blocks (control: keeps the spread
+                                     of sigma, removes the link to curvature)
+    trace_average:     use the running mean of each block's trace over all
+                       refreshes so far, instead of only the latest estimate
+    num_perturbations: directions averaged per step (1 = plain MeZO step)
+    eval_steps:        steps at which to measure held-out accuracy; the value
+                       num_steps means "after the last update"
+    eval_examples:     max validation examples to score (None = all)
+    log_block_details: save per-block traces and sigmas at every refresh
     """
     random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     model, tokenizer = load_model_and_tokenizer()
-    train_data, _ = load_sst2()
+    train_data, val_data = load_sst2()
     blocks = get_param_blocks(model)
 
     sigmas = {name: 1.0 for name in blocks}  # baseline default
     loss_log = []
     sigma_summary_log = []  # list of {step, min, mean, max}
+    block_details = []
+    eval_log = []
+    trace_sum, trace_count = {}, {}
 
     batch_rng = random.Random(seed)
     probe_rng = random.Random(seed + 1000)
+    control_rng = random.Random(seed + 2000)  # only used by sigma_mode="shuffled"
+    eval_steps = set(eval_steps)
+
+    def run_eval(step):
+        result = evaluate_accuracy(model, tokenizer, val_data, eval_examples)
+        result["step"] = step
+        eval_log.append(result)
+        print(f"step {step:4d}  val accuracy {result['accuracy']:.4f}  "
+              f"val loss {result['loss']:.4f}")
 
     for step in range(num_steps):
+        if step in eval_steps:
+            run_eval(step)
+
         if use_trace_scaling and step % trace_refresh_every == 0:
             probe_examples = [train_data[i] for i in
                                probe_rng.sample(range(len(train_data)), 1)]
             traces = estimate_all_block_traces(model, tokenizer,
-                                                probe_examples, blocks)
-            sigmas = compute_sigmas(traces, blocks)
+                                                probe_examples, blocks,
+                                                num_probes=num_probes)
+            traces_used = traces
+            if trace_average:
+                for n, t in traces.items():
+                    if not math.isnan(t):
+                        trace_sum[n] = trace_sum.get(n, 0.0) + t
+                        trace_count[n] = trace_count.get(n, 0) + 1
+                traces_used = {n: (trace_sum[n] / trace_count[n]
+                                   if trace_count.get(n) else float("nan"))
+                               for n in traces}
+            if sigma_mode == "shuffled":
+                names = list(traces_used.keys())
+                values_shuffled = [traces_used[n] for n in names]
+                control_rng.shuffle(values_shuffled)
+                traces_used = dict(zip(names, values_shuffled))
+            sigmas = compute_sigmas(traces_used, blocks, delta=delta,
+                                    rule=sigma_rule)
             values = list(sigmas.values())
             sigma_summary_log.append({
                 "step": step,
@@ -266,29 +384,60 @@ def train(use_trace_scaling, num_steps=500, batch_size=8, lr=1e-6,
                 "mean": sum(values) / len(values),
                 "max": max(values),
             })
+            if log_block_details:
+                block_details.append({
+                    "step": step,
+                    "traces": {n: _nan_to_none(t) for n, t in traces.items()},
+                    "traces_used": {n: _nan_to_none(t)
+                                    for n, t in traces_used.items()},
+                    "sigmas": dict(sigmas),
+                    "nan_blocks": sum(1 for t in traces.values() if t != t),
+                })
 
         batch_idx = batch_rng.sample(range(len(train_data)), batch_size)
         batch = [train_data[i] for i in batch_idx]
         random.seed(seed * 100000 + step)  # same perturbation seed in both methods
 
-        loss = mezo_step(model, tokenizer, batch, blocks, sigmas,
-                          epsilon, lr)
+        if num_perturbations == 1:
+            loss = mezo_step(model, tokenizer, batch, blocks, sigmas,
+                              epsilon, lr)
+        else:
+            loss = mezo_step_multi(model, tokenizer, batch, blocks, sigmas,
+                                    epsilon, lr, num_perturbations)
         loss_log.append(loss)
 
         if step % 20 == 0:
             print(f"step {step:4d}  loss {loss:.4f}")
 
+    if num_steps in eval_steps:
+        run_eval(num_steps)
+
     if log_path is not None:
         import json
+        record = {
+            "use_trace_scaling": use_trace_scaling,
+            "num_steps": num_steps,
+            "lr": lr,
+            "seed": seed,
+            "losses": loss_log,
+            "sigma_summary": sigma_summary_log,
+            "config": {
+                "batch_size": batch_size, "epsilon": epsilon,
+                "trace_refresh_every": trace_refresh_every,
+                "sigma_rule": sigma_rule, "delta": delta,
+                "num_probes": num_probes, "sigma_mode": sigma_mode,
+                "trace_average": trace_average,
+                "num_perturbations": num_perturbations,
+            },
+        }
+        if eval_log:
+            record["eval"] = eval_log
+        if log_block_details:
+            record["block_details"] = block_details
+            record["block_sizes"] = {n: sum(p.numel() for _, p in ps)
+                                     for n, ps in blocks.items()}
         with open(log_path, "w") as f:
-            json.dump({
-                "use_trace_scaling": use_trace_scaling,
-                "num_steps": num_steps,
-                "lr": lr,
-                "seed": seed,
-                "losses": loss_log,
-                "sigma_summary": sigma_summary_log,
-            }, f, indent=2)
+            json.dump(record, f, indent=2)
         print(f"saved log to {log_path}")
 
     return loss_log
