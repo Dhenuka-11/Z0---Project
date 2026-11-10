@@ -1,6 +1,0 @@
-torch
-transformers>=5.16
-datasets>=5.0
-numpy
-scipy
-matplotlib
