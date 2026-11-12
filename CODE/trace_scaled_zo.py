@@ -1,14 +1,13 @@
 """
-Trace-Scaled Zeroth-Order Fine-tuning — starting skeleton.
+Trace-Scaled Zeroth-Order Fine-tuning: OPT-125M on SST-2.
 
-This is a STARTING POINT, not finished, tested code. You will need to debug
-it in your own environment (it needs internet access to download the model
-and dataset from HuggingFace, and a GPU is strongly recommended). Read
-PROJECT_GUIDE.md alongside this file — each numbered section below matches
-a step in that guide.
+Plain MeZO (sigma_i = 1 for every block) versus trace-scaled MeZO (sigma_i set
+from a Hutchinson estimate of each block's Hessian trace). Needs internet access
+to download the model and dataset from HuggingFace, and a GPU for real runs.
+See README.md for how to run the experiments (run_seeds.py, run_ablations.py).
 
 Install first:
-    pip install torch transformers datasets accelerate scipy
+    pip install -r requirements.txt
 """
 
 import math
@@ -104,18 +103,18 @@ def evaluate_accuracy(model, tokenizer, examples, max_examples=None):
 
 def get_param_blocks(model):
     """
-    Group the model's parameters into named blocks. This simple version
-    groups by top-level module name (e.g. each transformer layer becomes
-    one block). Adjust the grouping logic to whatever granularity you want.
+    Group the model's parameters into named blocks: one block per module, i.e.
+    the parameter name without its last component, so a module's weight and
+    bias share a block (99 blocks for OPT-125M).
     Returns: dict {block_name: [ (param_name, param_tensor), ... ]}
     """
     blocks = {}
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        # crude grouping: use everything up to the 3rd dot as the block key
-        # e.g. "model.decoder.layers.4.self_attn.q_proj.weight"
-        #      -> "model.decoder.layers.4"
+        # block key = parameter name without its last component, e.g.
+        # "model.decoder.layers.4.self_attn.q_proj.weight"
+        #      -> "model.decoder.layers.4.self_attn.q_proj"
         block_key = name.rsplit(".", 1)[0] if "." in name else name
         blocks.setdefault(block_key, []).append((name, param))
     return blocks
@@ -248,7 +247,7 @@ def mezo_step(model, tokenizer, examples, blocks, sigmas, epsilon, lr):
                 z = torch.randn_like(p)
                 p.add_(-lr * grad_scalar * sigma * z)
 
-    return (loss_plus + loss_minus) / 2  # rough loss estimate for logging
+    return (loss_plus + loss_minus) / 2  # logged loss: average of the loss at +eps and -eps
 
 
 def mezo_step_multi(model, tokenizer, examples, blocks, sigmas, epsilon, lr,
